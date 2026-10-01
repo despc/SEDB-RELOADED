@@ -86,12 +86,6 @@ namespace SEDiscordBridge
             }
             catch (Exception) { }
 
-            if (!Plugin.Config.UseStatus)
-            {
-                Discord.DisconnectAsync();
-                Discord.ConnectAsync();
-            }
-
             Discord.MessageCreated += Discord_MessageCreated;
             Discord.SocketClosed += Discord_SocketError;
             Discord.Zombied += Discord_Zombied;
@@ -101,6 +95,18 @@ namespace SEDiscordBridge
                 Ready = true;
                 await Task.CompletedTask;
             };
+
+            // AutoReconnect usually resumes the old session: Discord then sends RESUMED, not READY
+            Discord.Resumed += (c, e) =>
+            {
+                Ready = true;
+                return Task.CompletedTask;
+            };
+
+            // handlers first, so the READY of this connect is not missed
+            Discord.ConnectAsync().ContinueWith(t =>
+                SEDiscordBridgePlugin.Log.Warn(t.Exception?.GetBaseException(), "Discord connect failed"),
+                TaskContinuationOptions.OnlyOnFaulted);
 
             return Task.CompletedTask;
         }
@@ -118,7 +124,7 @@ namespace SEDiscordBridge
         {
             Ready = false;
 
-            SEDiscordBridgePlugin.Log.Warn($"SocketClose Event: {e}");
+            SEDiscordBridgePlugin.Log.Warn($"SocketClose Event: code {e.CloseCode} {e.CloseMessage}");
 
             return Task.CompletedTask;
         }

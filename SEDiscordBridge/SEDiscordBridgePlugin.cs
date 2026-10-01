@@ -339,45 +339,33 @@ namespace SEDiscordBridge
         // for counter within _timer_elapsed() 
         private int i = 0;
         private DateTime timerStart = new DateTime(0);
-        private int TickRetry = 0;
+        // when the connection was last seen not ready; DateTime.MinValue while it is ready
+        private DateTime notReadySince = DateTime.MinValue;
+
+        // How long DSharpPlus gets to reconnect on its own (AutoReconnect, Zombied) before the client is made anew.
+        // Reconnecting from here sooner fought its reconnect and closed the socket again and again; so did taking a
+        // ping of 0 for a dead connection - it is 0 until the first heartbeat is acknowledged, up to 40 s after READY.
+        private static readonly TimeSpan ReconnectTimeout = TimeSpan.FromMinutes(2);
 
         private void Timer_Elapsed(object sender, ElapsedEventArgs e)
         {
             if (!Config.Enabled || DDBridge == null) return;
 
             if (DDBridge.Ready)
-                TickRetry = 0;
-
-            if (!DDBridge.Ready)
+                notReadySince = DateTime.MinValue;
+            else
             {
-                if (TickRetry == 5)
+                if (notReadySince == DateTime.MinValue)
+                    notReadySince = DateTime.UtcNow;
+                else if (DateTime.UtcNow - notReadySince > ReconnectTimeout)
                 {
+                    Log.Warn($"Discord not ready for {ReconnectTimeout.TotalMinutes:0} min, making the client anew");
+                    notReadySince = DateTime.MinValue;
                     DiscordBridge.Discord.DisconnectAsync();
-                    DiscordBridge.Discord.ConnectAsync();
+                    DiscordBridge.Discord.Dispose();
+                    DDBridge = new DiscordBridge(this);
+                    return;
                 }
-                else
-                {
-                    if (TickRetry > 24)
-                    {
-                        DDBridge.Ready = false;
-                        TickRetry = 0;
-                        DiscordBridge.Discord.DisconnectAsync();
-                        DiscordBridge.Discord.Dispose();
-                        DDBridge = new DiscordBridge(this);
-                        return;
-                    }
-                }
-
-                TickRetry++;
-            }
-            else if (DiscordBridge.Discord.Ping == 0)
-            {
-                DDBridge.Ready = false;
-                TickRetry = 0;
-                DiscordBridge.Discord.DisconnectAsync();
-                DiscordBridge.Discord.Dispose();
-                DDBridge = new DiscordBridge(this);
-                return;
             }
 
             if (Torch.CurrentSession == null || torchServer.SimulationRatio <= 0f)
