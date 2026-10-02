@@ -104,12 +104,16 @@ namespace SEDiscordBridge
                 }
 
                 Thread.Sleep(1000);
-                
+
+                // sent outside the lock: a send can wait for a reconnect and retry for seconds, and the other
+                // messages' tasks would stand on the lock all that time
+                List<TorchChatMessage> batch;
                 lock (_uniqueMessages)
                 {
-                    _uniqueMessages.ForEach(SendAsync);
+                    batch = new List<TorchChatMessage>(_uniqueMessages);
                     _uniqueMessages.Clear();
                 }
+                batch.ForEach(SendAsync);
                 return Task.CompletedTask;
             });
         }
@@ -177,19 +181,18 @@ namespace SEDiscordBridge
                 case TorchSessionState.Loaded:
                     //load
                     LoadSEDB();
-                    if (DDBridge != null) DDBridge.SendStatusMessage(null, Config.Started);
+                    // off the game thread: the send waits for the client that is only connecting now
+                    var bridge = DDBridge;
+                    if (bridge != null) Task.Run(() => bridge.SendStatusMessage(null, Config.Started));
                     break;
 
                 case TorchSessionState.Unloading:
-                    if (IsRestart)
+                    var stopMessage = IsRestart ? Config.Restarted : Config.Stopped;
+                    // waited for, so it goes out before the process ends, but no longer than this: the server is stopping
+                    if (stopMessage.Length > 0 && DDBridge != null)
                     {
-                        if (Config.Restarted.Length > 0)
-                            DDBridge.SendStatusMessage(null, Config.Restarted);
-                    }
-                    else
-                    {
-                        if (Config.Stopped.Length > 0)
-                            DDBridge.SendStatusMessage(null, Config.Stopped);
+                        var stopping = DDBridge;
+                        Task.Run(() => stopping.SendStatusMessage(null, stopMessage)).Wait(TimeSpan.FromSeconds(10));
                     }
                     break;
 

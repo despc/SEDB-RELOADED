@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Torch.API.Managers;
 using Torch.API.Session;
@@ -21,7 +22,6 @@ namespace SEDiscordBridge
         private readonly DiscordActivity game = new DiscordActivity();
         private string lastMessage = "";
         private ulong botId = 0;
-        private int retry = 0;
         public DiscordConfiguration DiscordConfiguration { get; set; }
         public bool Ready { get; set; } = false;
         public static DiscordClient Discord { get; set; }
@@ -174,103 +174,130 @@ namespace SEDiscordBridge
             }
         }
 
-        public async Task SendChatMessage(string user, string msg)
+        // How long a message waits for the client to be ready (a reconnect of the gateway) before it is sent anyway.
+        private const int ReadyWaitMs = 15000;
+
+        // Pauses before the second and the third attempt of a send that timed out or hit a network or server error.
+        private static readonly int[] RetryDelaysMs = { 2000, 5000 };
+
+        /// <summary>
+        /// One message to one channel. It goes by REST, which does not need the gateway: a message written while the
+        /// gateway reconnects (Ready false for a few seconds after a close) used to be dropped without a word, now it
+        /// waits up to <see cref="ReadyWaitMs"/> for the client and is sent. A timeout (TaskCanceledException after
+        /// HttpTimeout), a network error or a Discord server error is tried again - three attempts - instead of the
+        /// message being lost; what still fails throws to the caller, unwrapped. Blocks: thread pool only, never the
+        /// game thread.
+        /// </summary>
+        private DiscordMessage SendToChannel(ulong channelId, Func<DiscordChannel, string> makeText)
         {
-            if (lastMessage.Equals(user + msg)) return;
+            for (var waited = 0; !Ready && waited < ReadyWaitMs; waited += 500)
+                Thread.Sleep(500);
 
-            if (Ready && Plugin.Config.ChatChannelId.Length > 0)
+            for (var attempt = 0; ; attempt++)
             {
-                var OriginalMsg = msg;
-                foreach (var chanID in Plugin.Config.ChatChannelId.Split(' ')) {
-                    DiscordChannel chann = Discord.GetChannelAsync(ulong.Parse(chanID)).Result;
-                    //mention
-                    msg = MentionNameToID(OriginalMsg, chann);
-
-                    if (user != null)
-                        msg = Plugin.Config.Format.Replace("{msg}", msg).Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
-
-                    try {
-                        botId = Discord.SendMessageAsync(chann, msg.Replace("/n", "\n")).Result.Author.Id;
-                    }
-                    catch (DSharpPlus.Exceptions.RateLimitException) {
-                        if (retry <= 5) {
-                            retry++;
-                            await SendChatMessage(user, msg);
-                            retry = 0;
-                        }
-                        else {
-                            SEDiscordBridgePlugin.Log.Fatal($"Aborting send chat message (Too many attempts)");
-                            SEDiscordBridgePlugin.Log.Warn($"Message: {msg}");
-                        }
-                    }
-                    catch (DSharpPlus.Exceptions.RequestSizeException) {
-                        SEDiscordBridgePlugin.Log.Fatal($"Aborting send chat message (Request too large)");
-                        SEDiscordBridgePlugin.Log.Warn($"Message: {msg}");
-                        retry = 0;
-                    }
-                    catch (System.Net.Http.HttpRequestException) {
-                        SEDiscordBridgePlugin.Log.Fatal($"Unable to send message");
-                        SEDiscordBridgePlugin.Log.Warn($"Message: {msg}");
-                    }
-                    catch (DSharpPlus.Exceptions.NotFoundException) {
-                        SEDiscordBridgePlugin.Log.Fatal($"Could not find channel with ID of {chanID}");
-                    }
+                try
+                {
+                    var channel = Discord.GetChannelAsync(channelId).GetAwaiter().GetResult();
+                    return Discord.SendMessageAsync(channel, makeText(channel).Replace("/n", "\n")).GetAwaiter().GetResult();
                 }
-            }       
+                catch (Exception e) when (attempt < RetryDelaysMs.Length && Transient(e))
+                {
+                    SEDiscordBridgePlugin.Log.Warn($"Discord send to channel {channelId}: {Unwrap(e).GetType().Name}, trying again in {RetryDelaysMs[attempt] / 1000} s");
+                    Thread.Sleep(RetryDelaysMs[attempt]);
+                }
+            }
+        }
+
+        private static Exception Unwrap(Exception e) => (e as AggregateException)?.GetBaseException() ?? e;
+
+        private static bool Transient(Exception e)
+        {
+            e = Unwrap(e);
+            return e is TaskCanceledException || e is System.Net.Http.HttpRequestException ||
+                   e is DSharpPlus.Exceptions.ServerErrorException || e is DSharpPlus.Exceptions.RateLimitException;
+        }
+
+        private static void LogSendFailure(string what, Exception e, string text)
+        {
+            e = Unwrap(e);
+            if (e is DSharpPlus.Exceptions.NotFoundException)
+                SEDiscordBridgePlugin.Log.Error($"{what}: channel not found");
+            else
+                SEDiscordBridgePlugin.Log.Error($"{what}: not sent ({e.GetType().Name}: {e.Message})");
+            SEDiscordBridgePlugin.Log.Warn($"Message: {text}");
+        }
+
+        public Task SendChatMessage(string user, string msg)
+        {
+            if (lastMessage.Equals(user + msg) || Discord == null || Plugin.Config.ChatChannelId.Length == 0)
+                return Task.CompletedTask;
+
+            foreach (var chanID in Plugin.Config.ChatChannelId.Split(' '))
+            {
+                var text = msg;
+                try
+                {
+                    botId = SendToChannel(ulong.Parse(chanID), chann =>
+                    {
+                        text = MentionNameToID(msg, chann);
+                        if (user != null)
+                            text = Plugin.Config.Format.Replace("{msg}", text).Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
+                        return text;
+                    }).Author.Id;
+                }
+                catch (Exception e)
+                {
+                    LogSendFailure($"Chat message to channel {chanID}", e, text);
+                }
+            }
+            return Task.CompletedTask;
         }
 
         public void SendFacChatMessage(string user, string msg, string facName)
         {
-            try
+            if (Discord == null) return;
+            foreach (var chId in Plugin.Config.FactionChannels.Where(c => c.Split(':')[0].Equals(facName)))
             {
-                var channelIds = Plugin.Config.FactionChannels.Where(c => c.Split(':')[0].Equals(facName));
-
-                if (Ready && channelIds.Count() > 0)
+                var text = msg;
+                try
                 {
-                    foreach (var chId in channelIds)
+                    botId = SendToChannel(ulong.Parse(chId.Split(':')[1]), chann =>
                     {
-                        DiscordChannel chann = Discord.GetChannelAsync(ulong.Parse(chId.Split(':')[1])).Result;
-                        //mention
-                        msg = MentionNameToID(msg, chann);
-
+                        text = MentionNameToID(msg, chann);
                         if (user != null)
-                            msg = Plugin.Config.FacFormat.Replace("{msg}", msg).Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
-
-                        botId = Discord.SendMessageAsync(chann, msg.Replace("/n", "\n")).Result.Author.Id;
-                    }
+                            text = Plugin.Config.FacFormat.Replace("{msg}", text).Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
+                        return text;
+                    }).Author.Id;
                 }
-            }
-            catch (Exception e)
-            {
-                SEDiscordBridgePlugin.Log.Error($"SendFacChatMessage: {e.Message}");
+                catch (Exception e)
+                {
+                    LogSendFailure($"Faction message to {chId}", e, text);
+                }
             }
         }
 
         public void SendStatusMessage(string user, string msg, Torch.API.IPlayer obj = null)
         {
-            if (Ready && Plugin.Config.StatusChannelId.Length > 0)
+            if (Discord == null || Plugin.Config.StatusChannelId.Length == 0) return;
+
+            if (user != null)
             {
-                try
-                {
-                    DiscordChannel chann = Discord.GetChannelAsync(ulong.Parse(Plugin.Config.StatusChannelId)).Result;
+                if (user.StartsWith("ID:"))
+                    return;
 
-                    if (user != null)
-                    {
-                        if (user.StartsWith("ID:"))
-                            return;
+                if (obj != null && Plugin.Config.DisplaySteamId)
+                    user = $"{user} ({obj.SteamId})";
 
-                        if (obj != null && Plugin.Config.DisplaySteamId)
-                            user = $"{user} ({obj.SteamId})";
+                msg = msg.Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
+            }
 
-                        msg = msg.Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
-                    }
-
-                    botId = Discord.SendMessageAsync(chann, msg.Replace("/n", "\n")).Result.Author.Id;
-                }
-                catch (Exception e)
-                {
-                    SEDiscordBridgePlugin.Log.Error($"SendStatusMessage: {e.Message}");
-                }
+            try
+            {
+                botId = SendToChannel(ulong.Parse(Plugin.Config.StatusChannelId), _ => msg).Author.Id;
+            }
+            catch (Exception e)
+            {
+                LogSendFailure("Status message", e, msg);
             }
         }
 
