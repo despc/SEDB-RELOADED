@@ -267,6 +267,7 @@
   <ItemGroup>
     <Compile Include="Commands.cs" />
     <Compile Include="SEDBCommandHandler.cs" />
+    <Compile Include="Backlog.cs" />
     <Compile Include="DiscordBridge.cs" />
     <Compile Include="SEDBPatch.cs" />
     <Compile Include="SEDiscordBridgePlugin.cs" />

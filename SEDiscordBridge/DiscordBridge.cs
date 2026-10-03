@@ -62,6 +62,13 @@ namespace SEDiscordBridge
         private void DisconnectDiscord()
         {
             Ready = false;
+            lock (_backlog)
+            {
+                _backlogTimer?.Dispose();
+                _backlogTimer = null;
+            }
+            if (_backlog.Count > 0)
+                SEDiscordBridgePlugin.Log.Warn($"Discord is stopped with {_backlog.Count} message(s) not delivered");
             Discord?.DisconnectAsync();
         }
 
@@ -208,6 +215,81 @@ namespace SEDiscordBridge
             }
         }
 
+        // What Discord did not take in all the attempts: kept up to five minutes and tried again (Backlog).
+        private const int BacklogRetryMs = 10000;
+        private readonly Backlog _backlog = new Backlog();
+        private Timer _backlogTimer;
+        private int _flushing;
+
+        /// <summary>
+        /// One message to one channel that must not be lost to a few minutes without Discord. Sent at once (waiting for
+        /// the client, three attempts - <see cref="SendToChannel"/>); when Discord still gives no answer, the text is
+        /// kept and delivered later, joined with the others kept for the channel. A channel with messages waiting gets
+        /// the new one behind them at once: no half a minute of attempts for each, and the order stays.
+        /// Blocks: thread pool only.
+        /// </summary>
+        private void Deliver(ulong channelId, Func<DiscordChannel, string> makeText, string what)
+        {
+            var at = DateTime.UtcNow;
+            string text = null;
+            if (!_backlog.Waiting(channelId))
+            {
+                try
+                {
+                    botId = SendToChannel(channelId, channel => text = makeText(channel)).Author.Id;
+                    return;
+                }
+                catch (Exception e) when (Transient(e))
+                {
+                    SEDiscordBridgePlugin.Log.Warn($"{what}: no answer from Discord ({Unwrap(e).GetType().Name}), kept for {Backlog.KeepMs / 60000} minutes");
+                }
+                catch (Exception e)
+                {
+                    LogSendFailure(what, e, text ?? "");
+                    return;
+                }
+            }
+            // the text without asking Discord: the channel from the client's cache (none - mentions stay as written)
+            if (text == null)
+                text = makeText(Discord.Guilds.Values.Select(g => g.GetChannel(channelId)).FirstOrDefault(c => c != null));
+            _backlog.Add(channelId, at, text.Replace("/n", "\n"));
+            lock (_backlog)
+                if (_backlogTimer == null)
+                    _backlogTimer = new Timer(_ => FlushBacklog(), null, BacklogRetryMs, BacklogRetryMs);
+        }
+
+        private void FlushBacklog()
+        {
+            // one pass at a time: a pass waits for Discord's timeout
+            if (Interlocked.Exchange(ref _flushing, 1) == 1) return;
+            try
+            {
+                if (_backlog.Count == 0 || Discord == null) return;
+                var delivered = _backlog.Flush(DateTime.UtcNow,
+                    (channelId, text) =>
+                    {
+                        var channel = Discord.GetChannelAsync(channelId).GetAwaiter().GetResult();
+                        botId = Discord.SendMessageAsync(channel, text).GetAwaiter().GetResult().Author.Id;
+                    },
+                    Transient,
+                    (channelId, text, why) =>
+                    {
+                        SEDiscordBridgePlugin.Log.Error($"Message to channel {channelId}: not sent ({why})");
+                        SEDiscordBridgePlugin.Log.Warn($"Message: {text}");
+                    });
+                if (delivered > 0)
+                    SEDiscordBridgePlugin.Log.Info($"Discord answers again: {delivered} kept message(s) delivered, {_backlog.Count} waiting");
+            }
+            catch (Exception e)
+            {
+                SEDiscordBridgePlugin.Log.Error(e, "Discord backlog");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _flushing, 0);
+            }
+        }
+
         private static Exception Unwrap(Exception e) => (e as AggregateException)?.GetBaseException() ?? e;
 
         private static bool Transient(Exception e)
@@ -234,20 +316,21 @@ namespace SEDiscordBridge
 
             foreach (var chanID in Plugin.Config.ChatChannelId.Split(' '))
             {
-                var text = msg;
+                // {ts} is when it was written, also for a message delivered later
+                var written = TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString();
                 try
                 {
-                    botId = SendToChannel(ulong.Parse(chanID), chann =>
+                    Deliver(ulong.Parse(chanID), chann =>
                     {
-                        text = MentionNameToID(msg, chann);
+                        var text = MentionNameToID(msg, chann);
                         if (user != null)
-                            text = Plugin.Config.Format.Replace("{msg}", text).Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
+                            text = Plugin.Config.Format.Replace("{msg}", text).Replace("{p}", user).Replace("{ts}", written);
                         return text;
-                    }).Author.Id;
+                    }, $"Chat message to channel {chanID}");
                 }
                 catch (Exception e)
                 {
-                    LogSendFailure($"Chat message to channel {chanID}", e, text);
+                    LogSendFailure($"Chat message to channel {chanID}", e, msg);
                 }
             }
             return Task.CompletedTask;
@@ -258,20 +341,20 @@ namespace SEDiscordBridge
             if (Discord == null) return;
             foreach (var chId in Plugin.Config.FactionChannels.Where(c => c.Split(':')[0].Equals(facName)))
             {
-                var text = msg;
+                var written = TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString();
                 try
                 {
-                    botId = SendToChannel(ulong.Parse(chId.Split(':')[1]), chann =>
+                    Deliver(ulong.Parse(chId.Split(':')[1]), chann =>
                     {
-                        text = MentionNameToID(msg, chann);
+                        var text = MentionNameToID(msg, chann);
                         if (user != null)
-                            text = Plugin.Config.FacFormat.Replace("{msg}", text).Replace("{p}", user).Replace("{ts}", TimeZone.CurrentTimeZone.ToLocalTime(DateTime.Now).ToString());
+                            text = Plugin.Config.FacFormat.Replace("{msg}", text).Replace("{p}", user).Replace("{ts}", written);
                         return text;
-                    }).Author.Id;
+                    }, $"Faction message to {chId}");
                 }
                 catch (Exception e)
                 {
-                    LogSendFailure($"Faction message to {chId}", e, text);
+                    LogSendFailure($"Faction message to {chId}", e, msg);
                 }
             }
         }
@@ -293,7 +376,7 @@ namespace SEDiscordBridge
 
             try
             {
-                botId = SendToChannel(ulong.Parse(Plugin.Config.StatusChannelId), _ => msg).Author.Id;
+                Deliver(ulong.Parse(Plugin.Config.StatusChannelId), _ => msg, "Status message");
             }
             catch (Exception e)
             {
