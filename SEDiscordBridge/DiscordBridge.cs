@@ -192,10 +192,12 @@ namespace SEDiscordBridge
         /// gateway reconnects (Ready false for a few seconds after a close) used to be dropped without a word, now it
         /// waits up to <see cref="ReadyWaitMs"/> for the client and is sent. A timeout (TaskCanceledException after
         /// HttpTimeout), a network error or a Discord server error is tried again - three attempts - instead of the
-        /// message being lost; what still fails throws to the caller, unwrapped. Blocks: thread pool only, never the
-        /// game thread.
+        /// message being lost; what still fails throws to the caller, unwrapped. Every attempt carries the same
+        /// <paramref name="nonce"/>: Discord may have taken a send that timed out, and the next attempt put the line
+        /// into the channel a second time - with the nonce it gives back the message it has (<see cref="OnceSend"/>).
+        /// Returns the bot's id. Blocks: thread pool only, never the game thread.
         /// </summary>
-        private DiscordMessage SendToChannel(ulong channelId, Func<DiscordChannel, string> makeText)
+        private ulong SendToChannel(ulong channelId, Func<DiscordChannel, string> makeText, string nonce)
         {
             for (var waited = 0; !Ready && waited < ReadyWaitMs; waited += 500)
                 Thread.Sleep(500);
@@ -205,7 +207,7 @@ namespace SEDiscordBridge
                 try
                 {
                     var channel = Discord.GetChannelAsync(channelId).GetAwaiter().GetResult();
-                    return Discord.SendMessageAsync(channel, makeText(channel).Replace("/n", "\n")).GetAwaiter().GetResult();
+                    return SendOnce(channelId, makeText(channel).Replace("/n", "\n"), nonce);
                 }
                 catch (Exception e) when (attempt < RetryDelaysMs.Length && Transient(e))
                 {
@@ -213,6 +215,21 @@ namespace SEDiscordBridge
                     Thread.Sleep(RetryDelaysMs[attempt]);
                 }
             }
+        }
+
+        private static bool _noNonceSaid;
+
+        /// <summary>One send under a nonce; the bot's id.</summary>
+        private static ulong SendOnce(ulong channelId, string text, string nonce)
+        {
+            if (OnceSend.Available) return OnceSend.SendAsync(Discord, channelId, text, nonce).GetAwaiter().GetResult();
+            if (!_noNonceSaid)
+            {
+                _noNonceSaid = true;
+                SEDiscordBridgePlugin.Log.Warn("This DSharpPlus is not the one the nonce send was written for: a send that timed out and is sent again may come out twice");
+            }
+            var channel = Discord.GetChannelAsync(channelId).GetAwaiter().GetResult();
+            return Discord.SendMessageAsync(channel, text).GetAwaiter().GetResult().Author.Id;
         }
 
         // What Discord did not take in all the attempts: kept up to five minutes and tried again (Backlog).
@@ -232,15 +249,19 @@ namespace SEDiscordBridge
         {
             var at = DateTime.UtcNow;
             string text = null;
+            string sent = null;
             if (!_backlog.Waiting(channelId))
             {
+                var nonce = Backlog.NewNonce();
                 try
                 {
-                    botId = SendToChannel(channelId, channel => text = makeText(channel)).Author.Id;
+                    botId = SendToChannel(channelId, channel => text = makeText(channel), nonce);
                     return;
                 }
                 catch (Exception e) when (Transient(e))
                 {
+                    // the text may be there already: it is sent again as it is, under the same nonce
+                    if (text != null) sent = nonce;
                     SEDiscordBridgePlugin.Log.Warn($"{what}: no answer from Discord ({Unwrap(e).GetType().Name}), kept for {Backlog.KeepMs / 60000} minutes");
                 }
                 catch (Exception e)
@@ -252,7 +273,7 @@ namespace SEDiscordBridge
             // the text without asking Discord: the channel from the client's cache (none - mentions stay as written)
             if (text == null)
                 text = makeText(Discord.Guilds.Values.Select(g => g.GetChannel(channelId)).FirstOrDefault(c => c != null));
-            _backlog.Add(channelId, at, text.Replace("/n", "\n"));
+            _backlog.Add(channelId, at, text.Replace("/n", "\n"), sent);
             lock (_backlog)
                 if (_backlogTimer == null)
                     _backlogTimer = new Timer(_ => FlushBacklog(), null, BacklogRetryMs, BacklogRetryMs);
@@ -266,11 +287,7 @@ namespace SEDiscordBridge
             {
                 if (_backlog.Count == 0 || Discord == null) return;
                 var delivered = _backlog.Flush(DateTime.UtcNow,
-                    (channelId, text) =>
-                    {
-                        var channel = Discord.GetChannelAsync(channelId).GetAwaiter().GetResult();
-                        botId = Discord.SendMessageAsync(channel, text).GetAwaiter().GetResult().Author.Id;
-                    },
+                    (channelId, text, nonce) => botId = SendOnce(channelId, text, nonce),
                     Transient,
                     (channelId, text, why) =>
                     {

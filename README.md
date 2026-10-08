@@ -4,6 +4,15 @@
 A Torch plugin that allows you to connect a SE Server to specific channels on Discord.
 
 ### Changelog
+**08/10/2026**:
+
+- A chat line no longer comes out twice in Discord. A send that got no answer in ten seconds
+  (`TaskCanceledException, trying again in 2 s` in the Torch log) was sent again, though Discord often had taken the
+  first one. Every message now carries a nonce with `enforce_nonce`: all the attempts for it, and the later delivery
+  of a kept message, use the same one, and Discord does not create a message with a nonce it has seen in the last
+  few minutes. DSharpPlus 4.5.2 has no nonce in its sends, so the request is built in `OnceSend.cs` and goes through
+  its REST client (rate limits and timeout as before).
+
 **18/04/2020**:
 
 - Mitigate some issues that would cause a significant sim speed drop when a player joins/leaves the server.
